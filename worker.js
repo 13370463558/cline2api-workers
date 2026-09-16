@@ -19,12 +19,15 @@
  *     -d '{"model":"cline/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
  */
 
+import { connect } from "cloudflare:sockets";
+
 const CLINE_API_BASE = "https://api.cline.bot/api/v1";
 
 // 账号池：支持多个 Cline 账号，每个账号独立缓存 accessToken
 // CLINE_REFRESH_TOKEN 环境变量可包含多行，每行一个 refreshToken，
 // 额度用尽(空响应)时自动轮换下一个账号。
 // 结构：{ refreshToken, accessToken, expiry, cooldownUntil }
+let runtimeEnv = {};      // 当前请求的 env（供 SOCKS5 出站等工具函数读取）
 let accounts = [];
 let accountIndex = 0;          // round-robin 游标
 let currentAccount = null;     // 当前正在使用的账号（串行队列下安全）
@@ -54,7 +57,7 @@ async function refreshModels() {
     if (modelsCache && now - modelsCacheTime < MODELS_TTL) {
       return modelsCache;
     }
-    const resp = await fetch(CLINE_API_BASE + "/models", {
+    const resp = await upstreamFetch(CLINE_API_BASE + "/models", {
       headers: { "User-Agent": "Mozilla/5.0 (cline2api)" },
     });
     if (!resp.ok) {
@@ -117,7 +120,7 @@ async function refreshModels() {
 // =====================================================================
 async function refreshFreeModels() {
   try {
-    const resp = await fetch(CLINE_API_BASE + "/ai/cline/recommended-models", {
+    const resp = await upstreamFetch(CLINE_API_BASE + "/ai/cline/recommended-models", {
       headers: { "User-Agent": "Mozilla/5.0 (cline2api)" },
     });
     if (!resp.ok) return [];
@@ -134,10 +137,11 @@ async function refreshFreeModels() {
 // 默认模型：Cline 免费 DeepSeek V4.1 Flash 通道（cline-free/ 官方免费额度，无需 credits）
 // 逆向自官方插件 recommended-models free 列表：cline-free/deepseek-v4.1-flash
 const DEFAULT_MODEL = "cline-free/deepseek-v4.1-flash";
-const VERSION = "1.1.7";
+const VERSION = "1.2.0";
 
 export default {
   async fetch(request, env) {
+    runtimeEnv = env || {};
     const url = new URL(request.url);
 
     // CORS 预检
@@ -151,12 +155,17 @@ export default {
     // 健康诊断端点（无需鉴权，用于排查环境变量是否生效）
     if (request.method === "GET" && url.pathname === "/v1/health") {
       const poolN = parseAccounts(env).length;
+      const egress = upstreamEgressConfig(env);
       return jsonResponse({
         ok: true,
         version: VERSION,
         authenticated: !!(env.API_KEY),
         accounts: poolN,
         model: DEFAULT_MODEL,
+        // 出站方式：socks5=已启用代理池；direct=原生 fetch 直连
+        egress: egress.enabled ? "socks5" : "direct",
+        socks5_proxies: egress.proxies.length,
+        socks5_fallback: egress.enabled ? egress.fallback : null,
       }, 200);
     }
 
@@ -217,14 +226,18 @@ async function getAccountToken(account) {
   if (account.accessToken && now < account.expiry) {
     return account.accessToken;
   }
-  const resp = await fetch(CLINE_API_BASE + "/auth/refresh", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      refreshToken: account.refreshToken,
-      grantType: "refresh_token",
-    }),
-  });
+  const resp = await upstreamFetch(
+    CLINE_API_BASE + "/auth/refresh",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        refreshToken: account.refreshToken,
+        grantType: "refresh_token",
+      }),
+    },
+    { env: runtimeEnv, accountIndex: accounts.indexOf(account) },
+  );
   if (!resp.ok) {
     // 刷新失败：冷却 60s，交给上层切号
     account.cooldownUntil = now + 60 * 1000;
@@ -323,11 +336,15 @@ async function clineFetch(env, path, bodyObj, sessionId, retried = false) {
   currentToken = token;
   const headers = clineHeaders(sessionId);
   headers.Authorization = "Bearer workos:" + token;
-  const resp = await fetch(CLINE_API_BASE + path, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(bodyObj),
-  });
+  const resp = await upstreamFetch(
+    CLINE_API_BASE + path,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify(bodyObj),
+    },
+    { env: runtimeEnv, accountIndex: currentAccount ? accounts.indexOf(currentAccount) : -1 },
+  );
   if (resp.status === 401 && !retried) {
     // token 失效：标记当前账号冷却，强制重试（会用别的账号/刷新）
     if (currentAccount) {
@@ -896,3 +913,471 @@ function corsHeaders() {
   };
 }
 
+// ===========================================================================
+// SOCKS5 出站（可选，Cloudflare Workers 专有）
+// ===========================================================================
+// 配置 SOCKS5_PROXIES 后，上游请求改走 SOCKS5 隧道：
+//   TCP(明文) → SOCKS5 握手/认证 → CONNECT → startTls(按目标域名校验证书)
+//   → 手写 HTTP/1.1 收发（支持 chunked / Content-Length / EOF 三种响应体）
+// 账号 i 固定绑定代理 i % n：同一账号出口 IP 稳定，便于上游风控白名单。
+// 未配置时完全走原生 fetch 直连，行为与之前一致。
+//
+// 环境变量：
+//   SOCKS5_PROXIES         socks5://user:pass@host:port | socks5://host:port | host:port
+//                          逗号或换行分隔，可多个
+//   SOCKS5_MODE            auto(默认，配了代理就启用) | off(强制直连)
+//   SOCKS5_FALLBACK        1(默认)=代理链路异常时回退直连；0=直接报错，不回落
+//   SOCKS_TIMEOUT_MS       连接/握手/TLS 超时，默认 10000
+//   HEAD_TIMEOUT_MS        上游响应头超时，默认 30000
+//   STREAM_IDLE_TIMEOUT_MS 响应体空闲超时，默认 600000（0=不限）
+//
+// ⚠️ cloudflare:sockets 是 Workers 专有 API：本文件（CF 版）可用，
+//    api/index.js（Vercel Edge 版）不支持，故只在 CF 版接入。
+// ===========================================================================
+
+const HOP_BY_HOP = new Set([
+  "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+  "te", "trailer", "transfer-encoding", "upgrade", "content-length",
+]);
+
+const SOCKS5_REP = {
+  1: "general SOCKS server failure",
+  2: "connection not allowed by ruleset",
+  3: "network unreachable",
+  4: "host unreachable",
+  5: "connection refused",
+  6: "TTL expired",
+  7: "command not supported",
+  8: "address type not supported",
+};
+
+function intEnv(v, dflt) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : dflt;
+}
+
+// host:port | socks5://host:port | socks5://user:pass@host:port
+function parseProxyUrl(str) {
+  let s = String(str || "").trim();
+  if (!s) return null;
+  if (!/^[a-z0-9+.-]+:\/\//i.test(s)) s = "socks5://" + s;
+  let u;
+  try {
+    u = new URL(s);
+  } catch (e) {
+    return null;
+  }
+  const proto = u.protocol.replace(":", "").toLowerCase();
+  if (proto !== "socks5" && proto !== "socks5h") return null;
+  const port = u.port ? parseInt(u.port, 10) : 1080;
+  if (!u.hostname || !Number.isFinite(port)) return null;
+  return {
+    hostname: u.hostname,
+    port,
+    username: u.username ? decodeURIComponent(u.username) : "",
+    password: u.password ? decodeURIComponent(u.password) : "",
+  };
+}
+
+function upstreamEgressConfig(env) {
+  const e = env || {};
+  const proxies = String(e.SOCKS5_PROXIES || "")
+    .split(/[,\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map(parseProxyUrl)
+    .filter(Boolean);
+  const mode = String(e.SOCKS5_MODE || "auto").toLowerCase();
+  return {
+    proxies,
+    enabled: mode !== "off" && proxies.length > 0,
+    fallback: String(e.SOCKS5_FALLBACK === undefined ? "1" : e.SOCKS5_FALLBACK) !== "0",
+    socksTimeoutMs: intEnv(e.SOCKS_TIMEOUT_MS, 10000),
+    headTimeoutMs: intEnv(e.HEAD_TIMEOUT_MS, 30000),
+    idleTimeoutMs: intEnv(e.STREAM_IDLE_TIMEOUT_MS, 600000),
+  };
+}
+
+// 账号 i → 代理 i % n
+function proxyForAccount(cfg, accountIndex) {
+  if (!cfg.enabled) return null;
+  const i = Number.isInteger(accountIndex) && accountIndex >= 0 ? accountIndex : 0;
+  return cfg.proxies[i % cfg.proxies.length];
+}
+
+// 统一上游出口：配了代理走 SOCKS5，否则原生 fetch
+async function upstreamFetch(url, init = {}, opts = {}) {
+  const env = opts.env || runtimeEnv || {};
+  const cfg = upstreamEgressConfig(env);
+  if (!cfg.enabled) return fetch(url, init);
+  const proxy = proxyForAccount(cfg, opts.accountIndex);
+  if (!proxy) return fetch(url, init);
+  try {
+    const resp = await fetchViaSocks5(url, init, proxy, cfg);
+    return resp;
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    if (!cfg.fallback) throw new Error(`SOCKS5 出站失败 (${proxy.hostname}:${proxy.port}): ${msg}`);
+    console.log(`[socks5] ${proxy.hostname}:${proxy.port} 链路失败(${msg})，回退直连`);
+    return fetch(url, init);
+  }
+}
+
+async function fetchViaSocks5(url, init, proxy, cfg) {
+  const target = new URL(url);
+  if (target.protocol !== "https:") throw new Error("SOCKS5 出站仅支持 https 上游");
+  const host = target.hostname;
+  const port = target.port ? parseInt(target.port, 10) : 443;
+  const socket = await socks5Tunnel(proxy, host, port, cfg.socksTimeoutMs);
+  try {
+    return await httpOverTlsSocket(socket, target, init, cfg);
+  } catch (e) {
+    closeQuietly(socket);
+    throw e;
+  }
+}
+
+// 建立 SOCKS5 隧道并在隧道内完成 TLS 握手，返回 TLS socket
+async function socks5Tunnel(proxy, host, port, timeoutMs) {
+  const socket = connect({ hostname: proxy.hostname, port: proxy.port }, { secureTransport: "starttls" });
+  await withTimeout(socket.opened, timeoutMs, "连接 SOCKS5 代理超时", () => closeQuietly(socket));
+
+  const reader = socket.readable.getReader();
+  const writer = socket.writable.getWriter();
+  try {
+    await socks5Handshake(reader, writer, proxy, host, port, timeoutMs);
+  } finally {
+    releaseQuietly(reader);
+    releaseQuietly(writer);
+  }
+
+  const tls = socket.startTls({ expectedServerHostname: host });
+  try {
+    await withTimeout(tls.opened, timeoutMs, "隧道内 TLS 握手超时", () => closeQuietly(tls));
+  } catch (e) {
+    closeQuietly(tls);
+    throw e;
+  }
+  return tls;
+}
+
+// SOCKS5 握手 (RFC 1928) + 用户名密码认证 (RFC 1929) + CONNECT
+async function socks5Handshake(reader, writer, proxy, host, port, timeoutMs) {
+  const r = new SocksReader(reader, timeoutMs);
+  const needAuth = Boolean(proxy.username || proxy.password);
+  const enc = new TextEncoder();
+
+  await writer.write(new Uint8Array(needAuth ? [0x05, 0x02, 0x00, 0x02] : [0x05, 0x01, 0x00]));
+  const hello = await r.readExact(2, "方法协商");
+  if (hello[0] !== 0x05) throw new Error(`SOCKS5 协议版本错误: 0x${hello[0].toString(16)}`);
+  if (hello[1] === 0xff) throw new Error("SOCKS5 代理不接受任何认证方式");
+  if (hello[1] === 0x02) {
+    if (!needAuth) throw new Error("SOCKS5 代理要求用户名密码认证，但未配置");
+    const user = enc.encode(proxy.username);
+    const pass = enc.encode(proxy.password);
+    const req = new Uint8Array(3 + user.byteLength + pass.byteLength);
+    req[0] = 0x01;
+    req[1] = user.byteLength;
+    req.set(user, 2);
+    req[2 + user.byteLength] = pass.byteLength;
+    req.set(pass, 3 + user.byteLength);
+    await writer.write(req);
+    const auth = await r.readExact(2, "认证");
+    if (auth[1] !== 0x00) throw new Error(`SOCKS5 认证失败 (0x${auth[1].toString(16)})`);
+  } else if (hello[1] !== 0x00) {
+    throw new Error(`SOCKS5 代理要求不支持的认证方式: 0x${hello[1].toString(16)}`);
+  }
+
+  // CONNECT：域名模式，由代理解析 DNS
+  const hostBytes = enc.encode(host);
+  const req = new Uint8Array(7 + hostBytes.byteLength);
+  req[0] = 0x05; // VER
+  req[1] = 0x01; // CONNECT
+  req[2] = 0x00; // RSV
+  req[3] = 0x03; // ATYP = 域名
+  req[4] = hostBytes.byteLength;
+  req.set(hostBytes, 5);
+  req[5 + hostBytes.byteLength] = (port >> 8) & 0xff;
+  req[6 + hostBytes.byteLength] = port & 0xff;
+  await writer.write(req);
+
+  const head = await r.readExact(4, "CONNECT 应答");
+  if (head[0] !== 0x05) throw new Error(`SOCKS5 应答版本错误: 0x${head[0].toString(16)}`);
+  if (head[1] !== 0x00) {
+    throw new Error(`SOCKS5 CONNECT 失败: ${SOCKS5_REP[head[1]] || "rep=0x" + head[1].toString(16)}`);
+  }
+  const atyp = head[3];
+  if (atyp === 0x01) await r.readExact(4 + 2, "CONNECT 绑定地址");
+  else if (atyp === 0x04) await r.readExact(16 + 2, "CONNECT 绑定地址");
+  else if (atyp === 0x03) {
+    const len = await r.readExact(1, "CONNECT 绑定地址");
+    await r.readExact(len[0] + 2, "CONNECT 绑定地址");
+  } else {
+    throw new Error(`SOCKS5 未知地址类型: 0x${atyp.toString(16)}`);
+  }
+}
+
+// 带缓冲的精确读取（SOCKS5 握手用；握手结束时应无残留字节）
+class SocksReader {
+  constructor(reader, timeoutMs) {
+    this.reader = reader;
+    this.buf = new Uint8Array(0);
+    this.timeoutMs = timeoutMs;
+  }
+  async readExact(n, label) {
+    while (this.buf.byteLength < n) {
+      const { value, done } = await withTimeout(this.reader.read(), this.timeoutMs, `SOCKS5 ${label}读取超时`);
+      if (done) throw new Error(`SOCKS5 ${label}: 代理关闭了连接`);
+      if (value && value.byteLength) this.buf = concatBytes(this.buf, value);
+    }
+    const out = this.buf.slice(0, n);
+    this.buf = this.buf.slice(n);
+    return out;
+  }
+}
+
+// 在 TLS socket 上完成一次 HTTP/1.1 请求，返回标准 Response（body 为流）
+async function httpOverTlsSocket(socket, target, init, cfg) {
+  const method = String(init.method || "GET").toUpperCase();
+  const path = (target.pathname || "/") + (target.search || "");
+  const headers = new Headers(init.headers || {});
+  if (!headers.has("Accept-Encoding")) headers.set("Accept-Encoding", "identity");
+  if (!headers.has("User-Agent")) headers.set("User-Agent", "cline2api-socks5");
+
+  let bodyText = null;
+  if (init.body != null && method !== "GET" && method !== "HEAD") {
+    bodyText = typeof init.body === "string" ? init.body : await new Response(init.body).text();
+  }
+
+  const enc = new TextEncoder();
+  const lines = [`${method} ${path} HTTP/1.1`, `Host: ${target.host}`];
+  for (const [k, v] of headers) {
+    if (HOP_BY_HOP.has(k.toLowerCase())) continue;
+    lines.push(`${k}: ${v}`);
+  }
+  const bodyBytes = bodyText == null ? null : enc.encode(bodyText);
+  if (bodyBytes) lines.push(`Content-Length: ${bodyBytes.byteLength}`);
+  lines.push("Connection: close");
+
+  const writer = socket.writable.getWriter();
+  await withTimeout(writer.write(enc.encode(lines.join("\r\n") + "\r\n\r\n")), cfg.headTimeoutMs, "写入上游请求头超时", () => closeQuietly(socket));
+  if (bodyBytes) {
+    await withTimeout(writer.write(bodyBytes), cfg.headTimeoutMs, "写入上游请求体超时", () => closeQuietly(socket));
+  }
+  releaseQuietly(writer);
+
+  const reader = socket.readable.getReader();
+  let buf = new Uint8Array(0);
+  let headEnd = -1;
+  while (headEnd === -1) {
+    if (buf.byteLength > 256 * 1024) {
+      releaseQuietly(reader);
+      throw new Error("上游响应头过大");
+    }
+    const { value, done } = await withTimeout(
+      reader.read(), cfg.headTimeoutMs, "读取上游响应头超时", () => closeQuietly(socket),
+    );
+    if (done) {
+      releaseQuietly(reader);
+      throw new Error("上游在返回完整响应头之前关闭了连接");
+    }
+    if (value && value.byteLength) buf = concatBytes(buf, value);
+    headEnd = indexOfDoubleCrlf(buf);
+  }
+
+  const parsed = parseHttpHead(new TextDecoder().decode(buf.slice(0, headEnd)));
+  const rest = buf.slice(headEnd + 4);
+
+  if (parsed.status < 200) throw new Error(`上游返回临时响应状态码 ${parsed.status}`);
+
+  const outHeaders = new Headers();
+  for (const [k, v] of Object.entries(parsed.headers)) {
+    const lk = k.toLowerCase();
+    if (HOP_BY_HOP.has(lk) || lk === "set-cookie") continue;
+    outHeaders.set(k, v);
+  }
+
+  if (parsed.status === 204 || parsed.status === 304) {
+    releaseQuietly(reader);
+    closeQuietly(socket);
+    return new Response(null, { status: parsed.status, statusText: parsed.statusText, headers: outHeaders });
+  }
+
+  const isChunked = /(^|,)\s*chunked\s*(,|$)/i.test(parsed.headers["transfer-encoding"] || "");
+  const clenRaw = parsed.headers["content-length"];
+  const clen = clenRaw != null ? parseInt(clenRaw, 10) : null;
+
+  const base = new ReadableStream({
+    start(controller) {
+      if (rest.byteLength) controller.enqueue(rest);
+    },
+    async pull(controller) {
+      try {
+        const { value, done } = await readWithIdle(reader, cfg.idleTimeoutMs, socket);
+        if (done) {
+          releaseQuietly(reader);
+          closeQuietly(socket);
+          controller.close();
+          return;
+        }
+        if (value && value.byteLength) controller.enqueue(value);
+      } catch (err) {
+        releaseQuietly(reader);
+        closeQuietly(socket);
+        controller.error(err);
+      }
+    },
+    cancel() {
+      releaseQuietly(reader);
+      closeQuietly(socket);
+    },
+  });
+
+  let body = base;
+  if (isChunked) body = base.pipeThrough(chunkedDecodeStream());
+  else if (clen != null && Number.isFinite(clen) && clen >= 0) body = base.pipeThrough(fixedLengthStream(clen));
+
+  return new Response(body, { status: parsed.status, statusText: parsed.statusText, headers: outHeaders });
+}
+
+function parseHttpHead(text) {
+  const lines = text.split("\r\n");
+  const m = /^HTTP\/(\d(?:\.\d)?)\s+(\d{3})\s*(.*)$/.exec(lines[0] || "");
+  if (!m) throw new Error("上游响应头解析失败: " + String(lines[0]).slice(0, 60));
+  const headers = {};
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    const idx = line.indexOf(":");
+    if (idx <= 0) continue;
+    const k = line.slice(0, idx).trim().toLowerCase();
+    const v = line.slice(idx + 1).trim();
+    headers[k] = headers[k] ? headers[k] + ", " + v : v;
+  }
+  return { status: parseInt(m[2], 10), statusText: m[3] || "", headers };
+}
+
+function fixedLengthStream(total) {
+  let remaining = total;
+  return new TransformStream({
+    transform(chunk, controller) {
+      if (remaining <= 0) return;
+      const take = chunk.byteLength <= remaining ? chunk : chunk.slice(0, remaining);
+      remaining -= take.byteLength;
+      if (take.byteLength) controller.enqueue(take);
+    },
+  });
+}
+
+function chunkedDecodeStream() {
+  let buf = new Uint8Array(0);
+  let state = "size";
+  let remaining = 0;
+  const dec = new TextDecoder();
+  return new TransformStream({
+    transform(chunk, controller) {
+      buf = concatBytes(buf, chunk);
+      for (;;) {
+        if (state === "done") return;
+        if (state === "size") {
+          const idx = indexOfCrlf(buf);
+          if (idx === -1) return;
+          const line = dec.decode(buf.slice(0, idx)).trim();
+          buf = buf.slice(idx + 2);
+          const size = parseInt(line.split(";")[0].trim(), 16);
+          if (!Number.isFinite(size) || size < 0) throw new Error("chunked 解码失败: 非法块长度");
+          if (size === 0) {
+            state = "trailer";
+            continue;
+          }
+          remaining = size;
+          state = "data";
+        } else if (state === "data") {
+          if (buf.byteLength < remaining) return;
+          controller.enqueue(buf.slice(0, remaining));
+          buf = buf.slice(remaining);
+          remaining = 0;
+          state = "break";
+        } else if (state === "break") {
+          if (buf.byteLength < 2) return;
+          buf = buf.slice(2);
+          state = "size";
+        } else { // trailer
+          const idx = indexOfCrlf(buf);
+          if (idx === -1) return;
+          const line = dec.decode(buf.slice(0, idx));
+          buf = buf.slice(idx + 2);
+          if (line === "") {
+            state = "done";
+            return;
+          }
+        }
+      }
+    },
+  });
+}
+
+// 响应体读取：空闲超过 idleMs 视为链路卡死（idleMs <= 0 表示不限）
+async function readWithIdle(reader, idleMs, socket) {
+  if (!idleMs || idleMs <= 0) return reader.read();
+  return withTimeout(reader.read(), idleMs, "上游响应体空闲超时", () => closeQuietly(socket));
+}
+
+function withTimeout(promise, ms, message, onTimeout) {
+  if (!ms || ms <= 0) return promise;
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      if (onTimeout) {
+        try {
+          onTimeout();
+        } catch (e) {
+          /* ignore */
+        }
+      }
+      reject(new Error(message || "操作超时"));
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function concatBytes(a, b) {
+  if (!a || !a.byteLength) return b;
+  if (!b || !b.byteLength) return a;
+  const out = new Uint8Array(a.byteLength + b.byteLength);
+  out.set(a, 0);
+  out.set(b, a.byteLength);
+  return out;
+}
+
+function indexOfCrlf(buf) {
+  for (let i = 0; i + 1 < buf.byteLength; i++) {
+    if (buf[i] === 13 && buf[i + 1] === 10) return i;
+  }
+  return -1;
+}
+
+function indexOfDoubleCrlf(buf) {
+  for (let i = 0; i + 3 < buf.byteLength; i++) {
+    if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) return i;
+  }
+  return -1;
+}
+
+function releaseQuietly(r) {
+  try {
+    if (r && r.releaseLock) r.releaseLock();
+  } catch (e) {
+    /* ignore */
+  }
+}
+
+function closeQuietly(s) {
+  try {
+    if (s && s.close) s.close();
+  } catch (e) {
+    /* ignore */
+  }
+}

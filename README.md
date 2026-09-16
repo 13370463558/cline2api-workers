@@ -272,6 +272,38 @@ Model:    deepseek/deepseek-v4-flash   （默认）
 
 ---
 
+## 七、SOCKS5 出站代理（可选，仅 Cloudflare 版）
+
+默认走 Workers 原生 `fetch` 直连上游。若出口 IP 被上游风控、或想让每个账号固定一个出口 IP，可配 SOCKS5 代理池。
+
+### 环境变量
+
+- `SOCKS5_PROXIES` — 代理列表，换行或逗号分隔，支持 `socks5://user:pass@host:port`、`socks5://host:port`、`host:port`（默认端口 1080）
+- `SOCKS5_MODE` — `auto`（默认，配了代理就启用）/ `off`（强制直连）
+- `SOCKS5_FALLBACK` — `1`（默认）代理链路异常时回退直连；`0` 直接报错，不回落
+- `SOCKS_TIMEOUT_MS` — 连接代理 / SOCKS5 握手 / 隧道内 TLS 握手超时，默认 `10000`
+- `HEAD_TIMEOUT_MS` — 上游响应头超时，默认 `30000`
+- `STREAM_IDLE_TIMEOUT_MS` — 响应体空闲超时，默认 `600000`（0 = 不限）
+
+### 账号与代理的绑定规则
+
+账号 i（按 `CLINE_REFRESH_TOKEN` 的行序）固定绑定代理 `i % n`：**同一账号出口 IP 稳定**，切号即换 IP。例如 2 个账号 + 2 个代理，账号 0 走代理 0、账号 1 走代理 1。
+
+### 实现说明
+
+TCP 明文连代理 → SOCKS5 握手（含 RFC 1929 用户名密码认证）→ CONNECT（域名模式，由代理解析 DNS）→ `startTls` 在隧道内完成 TLS 握手（按目标域名校验证书）→ 手写 HTTP/1.1 收发。响应体三种编码都支持（chunked / Content-Length / EOF 截止），SSE 为边收边发，不缓冲整包。
+
+### 验证方式
+
+- `/v1/health` 会返回 `egress`（`socks5` / `direct`）、`socks5_proxies`（解析到的代理数）、`socks5_fallback`
+- 代理链路异常时打日志：`[socks5] host:port 链路失败(...)，回退直连`
+
+### ⚠️ 限制
+
+`cloudflare:sockets` 是 Workers 专有 API，**Vercel Edge 版（`api/index.js`）不支持**，Vercel 侧始终直连。代理池只在 Cloudflare 版生效。
+
+---
+
 ## 许可
 
 MIT © 2026 pingmike2
