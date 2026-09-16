@@ -144,7 +144,99 @@ curl https://cline2api.<你的子域>.workers.dev/v1/chat/completions \
 
 ---
 
-## 三、在 AgentScope 平台调用（模型接入）
+## 三、部署到 Vercel（可选 ✅ 推荐备一条）
+
+同一份代码可以**同时**部署到 Cloudflare Workers 和 Vercel，互为备份：
+
+- `worker.js` → Cloudflare Workers 入口
+- `api/index.js` → Vercel Edge Function 入口（逻辑与 `worker.js` 完全一致，仅入口/区域声明不同）
+- `vercel.json` → 路由重写，把 `/v1/*` 指到 `/api/index`，**不用改**
+
+> 💡 **什么时候值得加一条 Vercel**：CF Workers 域名对 `User-Agent` 挑得凶（非浏览器 UA 直接 `1010`），
+> 而 Vercel 域名不挑 UA（curl / python / SDK 默认 UA 都能直连）。如果你的客户端不好自定义请求头，
+> 用 Vercel 那条会更省事。
+
+### 需要的东西
+
+- 一个 Vercel 账号（Hobby 免费档即可：[vercel.com/signup](https://vercel.com/signup)）
+- 上一步拿到的 `CLINE_REFRESH_TOKEN`
+- **不需要**改代码、不需要 `package.json`、不需要构建命令（Framework Preset 选 `Other` 即可）
+
+### 方式①：Vercel CLI 部署（最快）
+
+```bash
+# 1. 安装 CLI（已装可跳过）
+npm i -g vercel
+
+# 2. 登录
+vercel login
+
+# 3. 拉代码
+git clone https://github.com/pingmike2/cline2api-workers.git
+cd cline2api-workers
+
+# 4. 首次关联项目（交互里选 Create new project，Framework Preset 选 Other）
+vercel link
+
+# 5. 配置环境变量（持久化到项目，多账号 refreshToken 一行一个）
+vercel env add CLINE_REFRESH_TOKEN production
+vercel env add API_KEY production
+
+# 6. 部署到生产
+vercel --prod
+```
+
+部署完成后地址是 `https://<项目名>.vercel.app`。
+
+> ⚠️ 两个容易踩的点：
+> - 环境变量要用 `vercel env add` 写入项目；`vercel --prod --env X=Y` 只对**当次部署**生效，不写进项目配置
+> - **改过环境变量后必须重新 `vercel --prod`**，运行时才会读到新值
+
+### 方式②：Dashboard 关联 Git（推送后自动部署）
+
+1. 打开 [vercel.com/new](https://vercel.com/new) → **Import Git Repository** → 选 `pingmike2/cline2api-workers`
+2. **Production Branch 选 `main`**（本仓库只有 main 一条分支，CF 和 Vercel 两份代码都在里面）
+3. **Framework Preset 选 `Other`**，Root Directory 保持 `.`（⚠️ 不要填 `api`）→ Build / Output 全部留空
+4. **Environment Variables** 添加：
+   - `CLINE_REFRESH_TOKEN` = 你的 refreshToken（必填，一行一个支持多账号）
+   - `API_KEY` = 你的访问密钥（可选，不设则用默认 `cline2api-default-key`）
+   - 环境至少勾 **Production**（想在预览环境测可再勾 Preview）
+5. **Deploy**
+
+之后 push 到 `main` 会自动部署；同样地，**改了环境变量要在 Deployments 里点一次 Redeploy** 才会生效。
+
+### 验证部署
+
+```bash
+# 健康检查（无需鉴权）
+curl https://<项目名>.vercel.app/v1/health
+```
+
+返回 `{"ok":true,"version":"1.1.7","model":"cline-free/deepseek-v4.1-flash",...}` 即成功。
+
+```bash
+# 聊天测试
+curl https://<项目名>.vercel.app/v1/chat/completions \
+  -H "Authorization: Bearer ***" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"cline-free/deepseek-v4.1-flash","messages":[{"role":"user","content":"你好"}]}'
+```
+
+### ⚠️ Vercel 部署的坑（实测）
+
+1. **Deployment Protection 会挡住域名**：默认开启时，`项目名-账号.vercel.app`、
+   `项目名-<hash>-账号.vercel.app` 这类域名会被 Vercel SSO 拦截（返回 302 跳
+   `vercel.com/sso-api`），**只有生产别名 `项目名.vercel.app` 是公开可访问的**。
+   如果三个域名全是 302，去 **Settings → Deployment Protection** 关掉 Vercel Authentication。
+2. **只跑美区**：`api/index.js` 里写死了 `regions: ["iad1", "sfo1"]`（美国西部/东部）。
+   要换区域就改这一行；去掉 `regions` 则跟随 Vercel 默认调度。
+3. **Hobby 免费档有商用限制**，且无 SLA，适合自用/备用。
+4. **Vercel 域名不挑 UA**（实测 curl / python-urllib 直连 200），CF Workers 域名则必须带浏览器 UA，
+   否则 `error code: 1010`。两边都部署时，客户端可优先指向 Vercel 域名。
+
+---
+
+## 四、在 AgentScope 平台调用（模型接入）
 
 把该 Worker 当作 OpenAI 兼容 API 接入 **AgentScope（QwenPaw / qwenpaw.agentscope.io）** 时：
 
@@ -191,12 +283,12 @@ User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 
 ---
 
-## 四、使用
+## 五、使用
 
 ```text
-Base URL: https://cline2api.<你的子域>.workers.dev/v1
+Base URL: https://cline2api.<你的子域>.workers.dev/v1   （或 https://<项目名>.vercel.app/v1）
 API Key:  <你设置的 API_KEY>
-Model:    deepseek/deepseek-v4-flash   （默认）
+Model:    cline-free/deepseek-v4.1-flash   （默认，免费）
 ```
 
 兼容 OpenAI 客户端（`/v1/chat/completions`）和 Anthropic 客户端（`/v1/messages`，自动转换）。
@@ -243,20 +335,24 @@ Model:    deepseek/deepseek-v4-flash   （默认）
 
 ---
 
-## 五、项目结构
+## 六、项目结构
 
 ```
 .
-├── worker.js               # 主 Worker 代码（部署核心）
+├── worker.js               # Cloudflare Workers 入口（CF 部署核心）
+├── api/index.js            # Vercel Edge Function 入口（Vercel 部署核心，与 worker.js 同源）
+├── vercel.json             # Vercel 路由重写：/v1/* → /api/index
+├── wrangler.toml           # CF 命令行部署配置（用复制代码方式可忽略）
 ├── cline_oauth.py          # 获取 CLINE_REFRESH_TOKEN 的脚本 ⭐
 ├── .github/workflows/
 │   └── get-token.yml       # 手动运行的工作流：在 TG 上获取 refreshToken
-├── wrangler.toml           # (可选) wrangler 命令行部署配置，用复制代码方式可忽略
-├── test_request.json       # 测试请求示例
-└── README.md               # 本文件
+├── README.md               # 本文件
+└── README-vercel.md        # Vercel 版补充说明（历史文档，主体见本文件第三章）
 ```
 
-## 六、获取 refreshToken 常见问题
+> ⚠️ `worker.js` 与 `api/index.js` **逻辑同源**：改功能时两份都要同步改（否则 CF 与 Vercel 行为会不一致）。
+
+## 七、获取 refreshToken 常见问题
 
 **Q: 谁能看到我的 refreshToken？**
 → 只有你。它存在 CF Workers 的**机密变量**里（加密存储，代码里看不到、日志里不显示）。不要把 `wrangler.toml` 里的变量跟真实 refreshToken 混写，机密务必用 `wrangler secret` 或 Dashboard 的"机密"类型。
@@ -265,7 +361,7 @@ Model:    deepseek/deepseek-v4-flash   （默认）
 → 会，但 Cline 的 refreshToken 有效期较长。如果将来请求返回 401/403 token 失效，重新跑 `cline_oauth.py` 拿新的即可。
 
 **Q: 免费额度够用吗？**
-→ `deepseek/deepseek-v4-flash`（默认）和 `poolside/laguna-s-2.1:free` 都是免费模型。
+→ `cline-free/deepseek-v4.1-flash`（默认）、`deepseek/deepseek-v4-flash` 和 `poolside/laguna-s-2.1:free` 都是免费模型。
    deepseek 有**每日免费额度**（用尽返回 429 "Daily free limit reached"，数小时后恢复）；
    多账号可缓解（`CLINE_REFRESH_TOKEN` 多行填多个 token，额度用尽自动切号）。
    `zai/glm-5.2` 为付费模型（约 $0.0008/次），走 Cline 系统凭证，无每日额度限制。
