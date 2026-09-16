@@ -205,12 +205,24 @@ Model:    deepseek/deepseek-v4-flash   （默认）
 
 | 模型 ID | 结果 |
 |---|---|
-| `deepseek/deepseek-v4-flash` | ✅ **免费可用**（默认；需完整 Cline 客户端头 + 强制 stream，已修复） |
+| `cline-free/deepseek-v4.1-flash` | ✅ **免费可用**（默认；逆向自官方插件 recommended-models 免费通道，无需 credits） |
+| `deepseek/deepseek-v4-flash` | ✅ **免费可用**（需完整 Cline 客户端头 + 强制 stream，已修复） |
 | `depth/deepseek-v4-flash` | ✅ **免费可用**（`deepseek/deepseek-v4-flash` 的拼写别名，同款，前端任一前缀均可） |
 | `poolside/laguna-s-2.1:free` | ✅ **免费可用** |
 | `zai/glm-5.2` | ✅ **可用（付费）**，走 Cline 系统凭证，约 $0.0008/次 |
+| `deepseek/deepseek-v4.1-flash` | ❌ **402 insufficient_credits**（付费档，余额不足；免费请用 `cline-free/` 前缀） |
 | `cline-free/glm-5.2` | ❌ **已下架**（上游 404 `model not found`，2026-08-06 实测） |
 | `cline-pass/*` | ❌ 403，需付费 cline-pass 订阅 |
+
+> ⚠️ **2026-09-16 更新：接入 DS V4.1 Flash 免费通道** ⭐
+> - **`cline-free/` 前缀 = Cline 官方插件免费通道**。官方插件（VS Code / JetBrains）通过
+>   `GET https://api.cline.bot/api/v1/ai/cline/recommended-models` 拉取模型列表，返回体里的
+>   **`free` 数组**就是免 credits 的模型，其中 `cline-free/deepseek-v4.1-flash` 为当前主力。
+> - **关键区别**：不带前缀的 `deepseek/deepseek-v4.1-flash` 是**付费档**（余额不足直接 402
+>   `insufficient_credits`）；只有 `cline-free/deepseek-v4.1-flash` 走官方免费额度。
+> - worker 每次刷新模型列表时会**同时拉取 `recommended-models`**，把 `free` 数组合并进模型池，
+>   官方日后调整免费模型可自动跟进，无需改代码。
+> - `forceStream`（非流式强制走上游 stream）已扩展到 `cline-free/` 与 `cline-pass/` 前缀。
 
 > ⚠️ **2026-08-06 更新**：
 > - **`cline-free/glm-5.2` 上游已下架**：该免费模型名在 Cline 上游返回 404 `model not found`（非请求头问题，
