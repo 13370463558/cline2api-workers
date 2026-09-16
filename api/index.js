@@ -137,7 +137,9 @@ const DEFAULT_MODEL = "cline-free/deepseek-v4.1-flash";
 const VERSION = "1.1.7";
 
 // =====================================================================
-// Vercel Edge Function 入口（vercel 分支）
+// Vercel Edge Function 入口
+// 与根目录 worker.js（Cloudflare Workers）同源，逻辑完全一致，
+// 仅部署入口与区域声明不同；改动时两份需同步。
 // Vercel Edge Function：区域在文件内声明（文档标准写法），美区 iad1/sfo1
 export const config = { runtime: "edge", regions: ["iad1", "sfo1"] };
 
