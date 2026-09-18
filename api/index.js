@@ -134,7 +134,7 @@ async function refreshFreeModels() {
 // 默认模型：Cline 免费 DeepSeek V4.1 Flash 通道（cline-free/ 官方免费额度，无需 credits）
 // 逆向自官方插件 recommended-models free 列表：cline-free/deepseek-v4.1-flash
 const DEFAULT_MODEL = "cline-free/deepseek-v4.1-flash";
-const VERSION = "1.1.7";
+const VERSION = "1.1.8";
 
 // =====================================================================
 // Vercel Edge Function 入口
@@ -484,11 +484,11 @@ async function handleChat(request, env) {
   // 构造上游 body（外部模型 ID 与 Cline 上游模型 ID 分离）
   const body = {
     model: upstreamModel,
-    max_tokens: params.max_tokens || params.max_completion_tokens || 128000,
     session_id: sessionId,
     reasoning_effort: params.reasoning_effort || params.reasoningEffort || "high",
     messages: params.messages || [],
   };
+  // ⚠️ 上游风控: 免费模型请求体带 max_tokens 字段一律 500 "empty response content"，剥离
   // ⚠️ 免费 DeepSeek 通道：非流式请求被上游限流(500 empty response content)，
   //    流式请求正常。所以客户端要非流式时，强制上游走 stream，再聚合返回。
   const forceStream = !isStream && (upstreamModel.startsWith("deepseek/") || upstreamModel.startsWith("cline-free/") || upstreamModel.startsWith("cline-pass/"));
@@ -685,11 +685,11 @@ async function handleAnthropic(request, env) {
 
   const body = {
     model: upstreamModel,
-    max_tokens: req.max_tokens || 128000,
     session_id: sessionId,
     reasoning_effort: "high",
     messages,
   };
+  // ⚠️ 上游风控: 免费模型请求体带 max_tokens 字段一律 500，剥离（同 chat/completions 路径）
   // ⚠️ 免费 DeepSeek 通道：非流式被上游限流，强制上游 stream 再聚合
   const forceStream = !isStream && (upstreamModel.startsWith("deepseek/") || upstreamModel.startsWith("cline-free/") || upstreamModel.startsWith("cline-pass/"));
   if (isStream || forceStream) body.stream = true;
