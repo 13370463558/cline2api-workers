@@ -382,4 +382,8 @@ Model:    cline-free/deepseek-v4.1-flash   （默认，免费）
 
 ## 许可
 
-MIT © 2026 pingmike2
+本项目基于 [luawei1/cline2api](https://github.com/luawei1/cline2api)（Go 版）逆向重写，遵循其原许可证：
+
+**MIT License** © 2026 [luawei1](https://github.com/luawei1) · 详见 [LICENSE](LICENSE)
+
+Workers 版改动部分同样以 MIT 协议开源。
