@@ -212,7 +212,7 @@ vercel --prod
 curl https://<项目名>.vercel.app/v1/health
 ```
 
-返回 `{"ok":true,"version":"1.1.7","model":"cline-free/deepseek-v4.1-flash",...}` 即成功。
+返回 `{"ok":true,"version":"1.1.8","model":"cline-free/deepseek-v4.1-flash",...}` 即成功。
 
 ```bash
 # 聊天测试
@@ -302,9 +302,21 @@ Model:    cline-free/deepseek-v4.1-flash   （默认，免费）
 | `depth/deepseek-v4-flash` | ✅ **免费可用**（`deepseek/deepseek-v4-flash` 的拼写别名，同款，前端任一前缀均可） |
 | `poolside/laguna-s-2.1:free` | ✅ **免费可用** |
 | `zai/glm-5.2` | ✅ **可用（付费）**，走 Cline 系统凭证，约 $0.0008/次 |
+| `z-ai/glm-5.3-flash` | ✅ **免费可用**（2026-09-19 修复，见下方 v1.1.8 说明） |
 | `deepseek/deepseek-v4.1-flash` | ❌ **402 insufficient_credits**（付费档，余额不足；免费请用 `cline-free/` 前缀） |
 | `cline-free/glm-5.2` | ❌ **已下架**（上游 404 `model not found`，2026-08-06 实测） |
 | `cline-pass/*` | ❌ 403，需付费 cline-pass 订阅 |
+
+> ⚠️ **2026-09-19 更新（v1.1.8）：剥离 `max_tokens`，解锁更多免费模型** ⭐
+> - **根因**：上游对免费模型的请求体只要带 `max_tokens` 字段，一律返回
+>   500 `{"error":"empty response content"}`——与请求头无关（指纹头齐全也照炸），
+>   是请求体字段触发。不带该字段即 200。
+> - **修复**：worker 构造上游 body 时不再注入 `max_tokens`（客户端传了也直接忽略）。
+>   已知代价：上游按自己节奏生成，客户端无法靠 `max_tokens` 提前截断输出。
+> - **收益**：`z-ai/glm-5.3-flash`（免费、带 reasoning）实测 200 可用；
+>   其余 `:free` 后缀模型同理受益——只要上游模型列表里标注免费的，理论上都能通，
+>   以 `GET /v1/models` 实际返回为准。GUI 的"测试模型"功能（固定发 `max_tokens:1`）
+>   之前必 500，现在也能正常测延迟了。
 
 > ⚠️ **2026-09-16 更新：接入 DS V4.1 Flash 免费通道** ⭐
 > - **`cline-free/` 前缀 = Cline 官方插件免费通道**。官方插件（VS Code / JetBrains）通过
@@ -361,7 +373,7 @@ Model:    cline-free/deepseek-v4.1-flash   （默认，免费）
 → 会，但 Cline 的 refreshToken 有效期较长。如果将来请求返回 401/403 token 失效，重新跑 `cline_oauth.py` 拿新的即可。
 
 **Q: 免费额度够用吗？**
-→ `cline-free/deepseek-v4.1-flash`（默认）、`deepseek/deepseek-v4-flash` 和 `poolside/laguna-s-2.1:free` 都是免费模型。
+→ `cline-free/deepseek-v4.1-flash`（默认）、`deepseek/deepseek-v4-flash`、`poolside/laguna-s-2.1:free` 和 `z-ai/glm-5.3-flash` 都是免费模型。
    deepseek 有**每日免费额度**（用尽返回 429 "Daily free limit reached"，数小时后恢复）；
    多账号可缓解（`CLINE_REFRESH_TOKEN` 多行填多个 token，额度用尽自动切号）。
    `zai/glm-5.2` 为付费模型（约 $0.0008/次），走 Cline 系统凭证，无每日额度限制。
